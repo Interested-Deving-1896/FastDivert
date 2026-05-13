@@ -1,0 +1,50 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class = WFPCALLOUTS
+ClassGuid = {8DB4B2E0-CBAD-45B2-AB82-BF47DBE5D323}
+Provider    = %ManufacturerName%
+CatalogFile = fast_divert_driver.cat
+PnpLockdown = 1
+DriverVer   = 01/01/2024,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+fast_divert_driver.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64.10.0...16299
+
+; This section name must match the decoration used above
+[Standard.NTamd64.10.0...16299]
+%fast_divert_driver.DeviceDesc% = DeviceInstall, Root\fast_divert_driver
+
+[Standard.NT$ARCH$]
+%fast_divert_driver.DeviceDesc% = DeviceInstall, Root\fast_divert_driver
+
+[DeviceInstall.NT$ARCH$]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+fast_divert_driver.sys
+
+[DeviceInstall.NT$ARCH$.Services]
+AddService = fast_divert_driver,%SPSVCINST_ASSOCSERVICE%, fast_divert_driver_Service_Inst
+
+[fast_divert_driver_Service_Inst]
+DisplayName    = %fast_divert_driver.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\fast_divert_driver.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "FastDivert Project"
+DiskName               = "fast_divert_driver Installation Disk"
+fast_divert_driver.DeviceDesc = "fast_divert_driver Device"
+fast_divert_driver.SVCDESC    = "fast_divert_driver Service"

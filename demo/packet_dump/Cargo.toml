@@ -1,0 +1,16 @@
+[package]
+name = "packet_dump"
+version = "0.1.0"
+edition = "2024"
+
+
+[[bin]]
+name = "packet_dump"
+path = "src/main.rs"
+
+
+[dependencies]
+ctrlc = "3.5.2"
+windows = { version = "0.62.2" }
+fastdivert = { path = "../../dll" }
+anyhow = "1.0.102"
