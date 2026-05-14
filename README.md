@@ -170,7 +170,7 @@ fn main() -> anyhow::Result<()> {
     // Open Divert handle with multi-threaded support
     let divert = Divert::open_with_driver_path(
         "true",                  // Filter string (e.g., true for all)
-        "FastDivert",                // Layer name
+        "FastDivert",
         "fast_divert.sys",
         Layer::Network as u32,
         0,
