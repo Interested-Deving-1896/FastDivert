@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2026 github.com/one-api. All rights reserved.
+ * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
+ * See: https://github.com/one-api/FastDivert#license
+ */
+
 use crate::ringbuffer::PacketData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2026 github.com/one-api. All rights reserved.
+ * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
+ * See: https://github.com/one-api/FastDivert#license
+ */
+
 use anyhow::{bail, Result};
 
 #[repr(u32)]
@@ -328,4 +334,4 @@ pub enum FileCallbackDecision {
     Allow,
     Deny,
     Redirect(String),
-}
+}
