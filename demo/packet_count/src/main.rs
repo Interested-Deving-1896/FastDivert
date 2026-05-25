@@ -5,7 +5,7 @@
  */
 
 use anyhow::{Context, Result};
-use fastdivert::{Divert, PollMode};
+use fastdivert::Divert;
 use fastdivert::{Flags, Layer};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,7 +57,6 @@ fn main() -> Result<()> {
     let pc_clone = Arc::clone(&packet_counts);
     let _handles = divert.poll_multi_threads(
         num_threads,
-        PollMode::BusyPoll,
         move |worker_id, packet| {
             // Get the statistics slot of the current core
             let slot = &pc_clone[worker_id as usize];

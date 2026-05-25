@@ -37,4 +37,10 @@ members = [
     "dll",
     "demo/packet_dump",
     "demo/packet_count",
+    "demo/file_monitor",
+    "demo/bpf_filter",
+    "demo/stream_monitor",
+    "demo/socket_monitor",
+    "demo/flow_monitor",
+    "demo/passthrough",
 ]
