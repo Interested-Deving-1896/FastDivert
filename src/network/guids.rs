@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 use wdk_sys::GUID;
 
 pub const PROVIDER_GUID: GUID = guid_from_str("{f41ad05c-5df1-4ae6-81f3-71d1eda6ba0a}");

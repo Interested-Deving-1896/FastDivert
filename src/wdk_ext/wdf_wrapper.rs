@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 #![allow(non_camel_case_types, non_snake_case)]
 
 use wdk_sys::NTSTATUS;
@@ -278,3 +272,13 @@ pub fn WdfObjectGetTypedContextWorker(
         )
     }
 }
+
+pub fn WdfFileObjectGetInitiatorProcessId(file_object: wdk_sys::WDFFILEOBJECT) -> u32 {
+    unsafe {
+        wdk_sys::call_unsafe_wdf_function_binding!(
+            WdfFileObjectGetInitiatorProcessId,
+            file_object
+        ) as u32
+    }
+}
+

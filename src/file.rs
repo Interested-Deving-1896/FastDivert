@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 use alloc::boxed::Box;
 use core::ffi::c_ushort;
 use core::ptr::null_mut;
@@ -13,13 +7,14 @@ use wdk_sys::{
     STATUS_SUCCESS,
 };
 
-use crate::context::Context;
+use crate::context::{Context, ModuleContext};
 use crate::ioctl_handler::{
     handle_initialize, handle_rb_map, handle_recv, handle_send, handle_startup,
 };
 use crate::ioctl_internal::*;
 use crate::wdk_ext::wdf_wrapper::*;
 use crate::{log, network};
+use crate::network::bpf::BpfInsn;
 
 /// WDF file object context type descriptor.
 ///
@@ -117,7 +112,7 @@ pub unsafe extern "C" fn file_create(
 pub unsafe extern "C" fn empty_purge_complete(_queue: wdk_sys::WDFQUEUE, _context: wdk_sys::WDFCONTEXT) {
 }
 
-/// File cleanup callback - removes WFP filters, clears ring buffer callbacks, marks closed.
+/// File cleanup callback - removes WFP filters/minifilters, clears ring buffer callbacks, marks closed.
 pub unsafe extern "C" fn file_cleanup(file_object: wdk_sys::WDFFILEOBJECT) {
     if file_object.is_null() {
         return;
@@ -131,15 +126,12 @@ pub unsafe extern "C" fn file_cleanup(file_object: wdk_sys::WDFFILEOBJECT) {
 
         let c = &mut *ctx;
 
-        // Clean up network context
-        network::wfp_init::uninit_wfp(c.network_ctx.fwpm_engine_handle, ctx);
-        c.network_ctx.filter_ids.clear();
-
-        // Clean up ring buffer callbacks
-        let rb = c.network_ctx.ring_buffer;
-        if !rb.is_null() {
-            (*rb).set_notify_callback(None, null_mut());
-            (*rb).clear_watching();
+        // Clean up active module context generically
+        if let Some(mut module_ctx) = c.module.take() {
+            match module_ctx {
+                ModuleContext::Network(mut net_m) => net_m.cleanup(ctx),
+                ModuleContext::File(mut file_m) => file_m.cleanup(ctx),
+            }
         }
 
         // We don't need to manually purge the recv_queue. Since its parent object is
@@ -237,6 +229,7 @@ pub unsafe extern "C" fn ioctl_callback(
         IOCTL_MAP_MM => unsafe { handle_map_mm_request(request, ctx, file_object) },
         IOCTL_RECV => unsafe { handle_recv_request(request, input_buffer_length) },
         IOCTL_SEND => unsafe { handle_send_request(request, ctx, input_buffer_length) },
+        IOCTL_SET_BPF => unsafe { handle_set_bpf_request(request, ctx, input_buffer_length) },
         _ => {
             log!(
                 "ioctl_callback: invalid IOCTL code {:#010X}",
@@ -331,7 +324,55 @@ fn handle_send_request(
     input_buffer_length: usize,
 ) {
     let status = handle_send(request, ctx, input_buffer_length);
-    WdfRequestComplete(request, status);
+    if status != STATUS_PENDING {
+        WdfRequestComplete(request, status);
+    }
+}
+
+fn handle_set_bpf_request(
+    request: wdk_sys::WDFREQUEST,
+    ctx_ptr: *mut Context,
+    input_buffer_length: usize,
+) {
+    unsafe {
+        let ctx = &mut *ctx_ptr;
+        let mut buffer_ptr: wdk_sys::PVOID = null_mut();
+        let mut buffer_length: usize = 0;
+
+        let status = WdfRequestRetrieveInputBuffer(
+            request,
+            0,
+            &mut buffer_ptr,
+            &mut buffer_length,
+        );
+
+        if !wdk::nt_success(status) {
+            log!("handle_set_bpf: WdfRequestRetrieveInputBuffer failed {:#010X}", status);
+            WdfRequestComplete(request, status);
+            return;
+        }
+
+        if buffer_length % core::mem::size_of::<BpfInsn>() != 0 {
+            log!("handle_set_bpf: invalid buffer size");
+            WdfRequestComplete(request, STATUS_INVALID_DEVICE_REQUEST);
+            return;
+        }
+
+        let num_insns = buffer_length / core::mem::size_of::<BpfInsn>();
+        let insns = core::slice::from_raw_parts(buffer_ptr as *const BpfInsn, num_insns);
+
+        let mut bpf_vec = alloc::vec::Vec::with_capacity(num_insns);
+        bpf_vec.extend_from_slice(insns);
+
+        if let Some(ModuleContext::Network(ref mut m)) = ctx.module {
+            m.bpf_program = bpf_vec;
+            log!("handle_set_bpf: successfully loaded {} BPF instructions", num_insns);
+            WdfRequestComplete(request, STATUS_SUCCESS);
+        } else {
+            log!("handle_set_bpf: active module is not network!");
+            WdfRequestComplete(request, STATUS_INVALID_DEVICE_REQUEST);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

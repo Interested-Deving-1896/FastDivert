@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 use crate::log;
 use crate::ringbuffer::data::RingBufferData;
 use crate::ringbuffer::mm::{KernelMemory, ReservedKernelMemory};
@@ -25,6 +19,7 @@ use wdk_sys::{
 pub struct RingBufferTransaction<'a> {
     rb: &'a PerCpuRingBuffer,
     core_index: u32,
+    pub(crate) start_tail: usize,
     offset: usize,
 }
 
@@ -40,8 +35,8 @@ impl<'a> RingBufferTransaction<'a> {
             )
         };
 
-        rb.push_slice_no_check(header_slice, self.offset);
-        rb.push_slice_no_check(data, self.offset + header_slice.len());
+        rb.push_slice_at(self.start_tail, header_slice, self.offset);
+        rb.push_slice_at(self.start_tail, data, self.offset + header_slice.len());
 
         self.offset += header_slice.len() + data.len();
         Ok(())
@@ -64,11 +59,50 @@ impl<'a> RingBufferTransaction<'a> {
             )
         };
 
-        rb.push_slice_no_check(header_slice, self.offset);
-        rb.push_mdl(mdl, mdl_offset, length, self.offset + header_slice.len())?;
+        rb.push_slice_at(self.start_tail, header_slice, self.offset);
+        rb.push_mdl_at(self.start_tail, mdl, mdl_offset, length, self.offset + header_slice.len())?;
 
         self.offset += header_slice.len() + length;
         Ok(())
+    }
+
+    /// Pushes data directly from an MDL into the ring buffer without a header.
+    pub fn push_mdl_only(
+        &mut self,
+        mdl: PMDL,
+        mdl_offset: usize,
+        length: usize,
+    ) -> Result<(), NTSTATUS> {
+        let rb = self.rb.get_ring_buffer(self.core_index);
+        rb.push_mdl_at(self.start_tail, mdl, mdl_offset, length, self.offset)?;
+        self.offset += length;
+        Ok(())
+    }
+
+    /// Pushes a byte slice into the ring buffer without a header.
+    pub fn push_slice_only(&mut self, data: &[u8]) {
+        let rb = self.rb.get_ring_buffer(self.core_index);
+        rb.push_slice_at(self.start_tail, data, self.offset);
+        self.offset += data.len();
+    }
+
+    /// Returns the raw virtual address and the contiguous size available for writing at the current offset.
+    /// If the write wraps around, it returns the first part and the second part.
+    pub fn get_write_ptrs(&self, len: usize) -> (*mut u8, usize, *mut u8, usize) {
+        let rb = self.rb.get_ring_buffer(self.core_index);
+        let write_offset = (self.start_tail + self.offset) & rb.mask();
+        let len1 = (rb.size() - write_offset).min(len);
+        let len2 = len - len1;
+
+        let ptr1 = unsafe { rb.addr_virtual().add(write_offset) };
+        let ptr2 = if len2 > 0 { rb.addr_virtual() } else { core::ptr::null_mut() };
+
+        (ptr1, len1, ptr2, len2)
+    }
+
+    /// Advances the offset after a custom write.
+    pub fn advance_offset(&mut self, len: usize) {
+        self.offset += len;
     }
 }
 
@@ -153,7 +187,16 @@ impl PerCpuRingBuffer {
                 let data_ptr = (rb_data_va as *mut u8).add(core as usize * size);
                 let header_ptr = (header_mem.va as *mut RingBufferHeader).add(core as usize);
 
-                let rb = RingBufferData::new(size, header_ptr, data_ptr)
+                // If workers_num is <= 1, the only queue (index 0) must be a CAS queue.
+                // Otherwise, the last queue (index workers_num - 1) is a CAS queue,
+                // and all preceding queues (0..workers_num - 1) are SPSC queues.
+                let is_cas = if workers_num <= 1 {
+                    true
+                } else {
+                    core == workers_num - 1
+                };
+
+                let rb = RingBufferData::new(size, header_ptr, data_ptr, is_cas)
                     .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
                 ring_buffer_data.push(rb);
             }
@@ -212,11 +255,17 @@ impl PerCpuRingBuffer {
     }
 
     /// Retrieves the internal ring buffer structure for a specific core.
-    fn get_ring_buffer(&self, core: u32) -> &RingBufferData {
-        if core < self.workers_num {
+    ///
+    /// Implements dynamic routing for CPU hotplugging/overflow:
+    /// - Cores `< workers_num - 1` are routed to their dedicated SPSC queue.
+    /// - Cores `>= workers_num - 1` are routed to the shared CAS MPSC queue (the last queue).
+    pub(crate) fn get_ring_buffer(&self, core: u32) -> &RingBufferData {
+        if self.workers_num <= 1 {
+            &self.rb_datas[0]
+        } else if core < self.workers_num - 1 {
             &self.rb_datas[core as usize]
         } else {
-            &self.rb_datas[(core % self.workers_num) as usize]
+            &self.rb_datas[self.workers_num as usize - 1]
         }
     }
 
@@ -242,8 +291,7 @@ impl PerCpuRingBuffer {
 
     /// Reads data from the ring buffer into the destination slice.
     pub fn pop_slice(&self, core: u32, dest: &mut [u8], offset_from_head: usize) -> Result<(), ()> {
-        self.get_ring_buffer(core)
-            .pop_slice(dest, offset_from_head)
+        self.get_ring_buffer(core).pop_slice(dest, offset_from_head)
     }
 
     /// Advances the consumer head pointer, effectively consuming the read packets.
@@ -253,9 +301,10 @@ impl PerCpuRingBuffer {
 
     /// Starts a transaction to write into the ring buffer.
     ///
-    /// Provides the expected total size to check for available space. If the closure
-    /// returns `Ok`, the tail pointer is committed, and if the consumer is watching,
-    /// the notification callback is triggered.
+    /// Provides the expected total size to check for available space and atomically reserve it.
+    /// If the closure returns `Ok`, the tail pointer is committed and the consumer is notified.
+    /// Under CAS mode, if the closure fails or returns `Err`, a fail-safe dummy record is committed
+    /// to prevent deadlocking subsequent producers in the CAS queue.
     pub fn transaction<F, R>(
         &self,
         core_index: u32,
@@ -267,46 +316,74 @@ impl PerCpuRingBuffer {
     {
         let rb = self.get_ring_buffer(core_index);
 
-        if !rb.check_free_space(expected_total_size) {
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
-        }
+        // Atomically reserve space and get the unique start_tail
+        let start_tail = rb.reserve_space(expected_total_size)?;
 
         let mut tx = RingBufferTransaction {
             rb: self,
             core_index,
+            start_tail,
             offset: 0,
         };
 
         match f(&mut tx) {
             Ok(res) => {
                 if tx.offset > 0 {
-                    self.commit_tail(core_index, tx.offset);
+                    // Commit the actually written bytes
+                    rb.commit_tail(start_tail, tx.offset);
+
+                    // Under high load, we MUST ensure that the queue is poked if there are packets.
+                    // We use is_watching to avoid redundant DPC/callback overhead.
+                    // If it was true, we set it to false and fire the callback.
+                    if self.is_watching.swap(false, Ordering::Acquire) {
+                        let (cb, ctx) = unsafe {
+                            self.notify_lock.acquire();
+                            let cb = self.notify_cb;
+                            let ctx = self.notify_ctx;
+                            self.notify_lock.release();
+                            (cb, ctx)
+                        };
+
+                        if let Some(cb) = cb {
+                            unsafe { cb(ctx) };
+                        }
+                    }
+                } else if rb.is_cas() {
+                    // Fail-safe under CAS: even if offset is 0, we reserved space, so we must
+                    // write a dummy record and commit expected_total_size to avoid deadlocking subsequent threads.
+                    let dummy_header = RecordHeader {
+                        len: (expected_total_size - core::mem::size_of::<RecordHeader>()) as u32,
+                        _reserved: 0xDEADBEEF,
+                    };
+                    let dummy_slice = unsafe {
+                        core::slice::from_raw_parts(
+                            &dummy_header as *const _ as *const u8,
+                            core::mem::size_of::<RecordHeader>(),
+                        )
+                    };
+                    rb.push_slice_at(start_tail, dummy_slice, 0);
+                    rb.commit_tail(start_tail, expected_total_size);
                 }
                 Ok(res)
             }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Commits the tail pointer and triggers the notify callback if needed.
-    fn commit_tail(&self, core_index: u32, delta: usize) {
-        let rb = self.get_ring_buffer(core_index);
-        rb.add_tail(delta);
-
-        // Under high load, we MUST ensure that the queue is poked if there are packets.
-        // We use is_watching to avoid redundant DPC/callback overhead.
-        // If it was true, we set it to false and fire the callback.
-        if self.is_watching.swap(false, Ordering::Acquire) {
-            let (cb, ctx) = unsafe {
-                self.notify_lock.acquire();
-                let cb = self.notify_cb;
-                let ctx = self.notify_ctx;
-                self.notify_lock.release();
-                (cb, ctx)
-            };
-
-            if let Some(cb) = cb {
-                unsafe { cb(ctx) };
+            Err(e) => {
+                if rb.is_cas() {
+                    // Fail-safe under CAS: write a dummy record and commit expected_total_size
+                    // to avoid deadlocking subsequent threads.
+                    let dummy_header = RecordHeader {
+                        len: (expected_total_size - core::mem::size_of::<RecordHeader>()) as u32,
+                        _reserved: 0xDEADBEEF,
+                    };
+                    let dummy_slice = unsafe {
+                        core::slice::from_raw_parts(
+                            &dummy_header as *const _ as *const u8,
+                            core::mem::size_of::<RecordHeader>(),
+                        )
+                    };
+                    rb.push_slice_at(start_tail, dummy_slice, 0);
+                    rb.commit_tail(start_tail, expected_total_size);
+                }
+                Err(e)
             }
         }
     }

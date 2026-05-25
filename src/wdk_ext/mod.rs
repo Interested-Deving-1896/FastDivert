@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 pub mod wdf_wrapper;
 
 #[allow(
@@ -88,4 +82,18 @@ pub mod ntddk {
             }
         }
     }
+}
+
+#[allow(
+    unused_unsafe,
+    unsafe_op_in_unsafe_fn,
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    clippy::all
+)]
+#[allow(warnings)]
+pub mod flt {
+    pub use wdk_sys::{GUID, HANDLE, PMDL};
+    include!(concat!(env!("OUT_DIR"), "/flt_bindings.rs"));
 }

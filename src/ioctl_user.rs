@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct DivertAddress {
@@ -149,6 +143,7 @@ pub const LAYER_SOCKET: Layer = 3;
 pub const LAYER_REFLECT: Layer = 4;
 pub const LAYER_TRANSPORT: Layer = 5;
 pub const LAYER_STREAM: Layer = 6;
+pub const LAYER_FILE: Layer = 7;
 
 
 pub enum Flags {

@@ -1,12 +1,10 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 mod data;
 mod per_cpu_ring;
+mod locked_ring;
 mod mm;
+mod cas_queue;
+
+pub use cas_queue::LockFreeQueue;
 
 use crate::wdk_ext::ndis::*;
 use core::ptr::null_mut;
@@ -14,6 +12,7 @@ use core::sync::atomic::AtomicUsize;
 use wdk_sys::{NTSTATUS, PMDL, PVOID, STATUS_INSUFFICIENT_RESOURCES, ULONG};
 
 pub use per_cpu_ring::PerCpuRingBuffer;
+pub use locked_ring::LockedRingBuffer;
 
 #[repr(C, align(64))]
 pub struct ProducerHeader {
@@ -31,12 +30,14 @@ pub struct RingBufferHeader {
     pub c: ConsumerHeader,
 }
 
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct RecordHeader {
     pub len: u32,
-    pub ty: u32,
+    pub _reserved: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RecordType {
     Invalid = 0,

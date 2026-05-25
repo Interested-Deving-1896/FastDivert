@@ -1,12 +1,7 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 use crate::driver_install::open_or_install_driver;
+use crate::bpf_compiler::BpfInsn;
 use crate::ioctl::{initialize, startup};
-use crate::{ioctl_code, DivertAddress, PacketData, PacketRef, PollMode, RingBufferClient};
+use crate::{ioctl_code, DivertAddress, PacketData, PacketRef, RingBufferClient};
 use anyhow::{bail, Context};
 use std::thread;
 use windows::Win32::Foundation::HANDLE;
@@ -48,14 +43,15 @@ impl SharedState {
 /// Internal helper to check the filter string.
 fn check_filter(filter: &str) -> anyhow::Result<()> {
     if filter != "true" {
-        bail!("Filter expressions other than 'true' are not yet supported");
+        // We now support BPF, so we don't fail here. BPF filter is compiled and set separately.
+        // We could theoretically compile and set it here, but keeping it explicit is better for now.
     }
     Ok(())
 }
 
 /// Internal helper to resolve driver path. If only a filename is provided,
 /// it resolves to the current executable's directory.
-fn resolve_driver_path(path: &str) -> anyhow::Result<String> {
+pub fn resolve_driver_path(path: &str) -> anyhow::Result<String> {
     let p = std::path::Path::new(path);
     if p.components().count() <= 1 {
         let mut driver_path = std::env::current_exe()
@@ -95,13 +91,73 @@ pub fn open_handle(
     Ok(handle)
 }
 
+pub fn set_bpf_filter(handle: HANDLE, insns: &[BpfInsn]) -> anyhow::Result<()> {
+    let mut bytes_returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            handle,
+            ioctl_code::IOCTL_SET_BPF,
+            Some(insns.as_ptr() as *const _),
+            (insns.len() * std::mem::size_of::<BpfInsn>()) as u32,
+            None,
+            0,
+            Some(&mut bytes_returned),
+            None,
+        )
+    }
+    .ok()
+    .context("IOCTL_SET_BPF failed: driver handle might be closed or invalid")
+}
+
+/// Sends zero-copy/wrapped packet data via a raw driver handle.
+pub fn send_data(rb_client: &RingBufferClient, addr: &DivertAddress, data: &PacketData<'_>) -> anyhow::Result<()> {
+    let addr_size = std::mem::size_of::<DivertAddress>();
+    let data_len = data.len();
+    let mut buffer = Vec::with_capacity(addr_size + data_len);
+
+    // 1. Copy DivertAddress bytes
+    let addr_slice = unsafe {
+        std::slice::from_raw_parts(addr as *const DivertAddress as *const u8, addr_size)
+    };
+    buffer.extend_from_slice(addr_slice);
+
+    // 2. Copy PacketData bytes
+    match data {
+        PacketData::Contiguous(s) => {
+            buffer.extend_from_slice(s);
+        }
+        PacketData::Wrapped { part1, part2 } => {
+            buffer.extend_from_slice(part1);
+            buffer.extend_from_slice(part2);
+        }
+    }
+
+    let mut bytes_returned = 0u32;
+    let res = unsafe {
+        DeviceIoControl(
+            rb_client.handle(),
+            ioctl_code::IOCTL_SEND,
+            Some(buffer.as_ptr() as *const core::ffi::c_void),
+            buffer.len() as u32,
+            None,
+            0,
+            Some(&mut bytes_returned),
+            None,
+        )
+    };
+
+    if let Err(e) = res {
+        if e.code() != windows::Win32::Foundation::ERROR_IO_PENDING.to_hresult() {
+            return Err(anyhow::anyhow!(e).context("IOCTL_SEND failed: failed to inject packet via driver"));
+        }
+    }
+
+    Ok(())
+}
+
 /// Sends a packet via a raw driver handle.
 pub fn send(rb_client: &RingBufferClient, addr: &DivertAddress, data: &[u8]) -> anyhow::Result<()> {
-    rb_client
-        .push_send_packet(addr, data)
-        .with_context(|| "RingBuffer push failed: the buffer might be full")?;
-    rb_client.flush_send()?;
-    Ok(())
+    send_data(rb_client, addr, &PacketData::Contiguous(data))
 }
 
 /// Receives a packet via a raw driver handle into a buffer.
@@ -182,7 +238,6 @@ pub fn wait_for_data(handle: HANDLE) -> anyhow::Result<()> {
 pub fn poll_cores<F, N>(
     shared_state: SharedState,
     cores: &[u32],
-    mode: PollMode,
     mut callback: F,
     mut no_packet_callback: N,
 ) -> anyhow::Result<()>
@@ -190,7 +245,6 @@ where
     F: FnMut(PacketRef<'_>),
     N: FnMut(),
 {
-    let handle = shared_state.handle();
     let rb_client = shared_state.rb_client();
 
     loop {
@@ -204,14 +258,7 @@ where
         }
 
         if !processed {
-            match mode {
-                PollMode::BusyPoll => {
-                    no_packet_callback();
-                }
-                PollMode::Default | PollMode::IoctlWait => {
-                    wait_for_data(handle)?;
-                }
-            }
+            no_packet_callback();
         }
     }
 }
@@ -220,7 +267,6 @@ where
 pub fn poll_multi_threads<F, N>(
     shared_state: SharedState,
     num_threads: u32,
-    mode: PollMode,
     callback: F,
     no_packet_callback: N,
 ) -> Vec<thread::JoinHandle<()>>
@@ -243,7 +289,7 @@ where
             .collect();
 
         handles.push(thread::spawn(move || {
-            let _ = poll_cores(state, &cores, mode, |p| cb(thread_idx, p), ncb);
+            let _ = poll_cores(state, &cores, |p| cb(thread_idx, p), ncb);
         }));
     }
     handles

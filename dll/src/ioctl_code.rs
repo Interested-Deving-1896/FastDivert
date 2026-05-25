@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 pub const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
     (device_type << 16) | (access << 14) | (function << 2) | method
 }
@@ -46,6 +40,13 @@ pub const IOCTL_MAP_MM: u32 = ctl_code(
     FILE_DEVICE_NETWORK,
     0x930,
     METHOD_OUT_DIRECT,
+    FILE_READ_DATA | FILE_WRITE_DATA,
+);
+
+pub const IOCTL_SET_BPF: u32 = ctl_code(
+    FILE_DEVICE_NETWORK,
+    0x931,
+    METHOD_IN_DIRECT,
     FILE_READ_DATA | FILE_WRITE_DATA,
 );
 

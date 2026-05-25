@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 use crate::ioctl_code::{
     DivertIoctlInitialize, DivertIoctlMMapRequest, DivertIoctlMMapResponse, DivertIoctlStartup,
     IOCTL_INITIALIZE, IOCTL_MAP_MM, IOCTL_STARTUP,
@@ -35,8 +29,7 @@ pub fn initialize(
             size_of::<crate::ioctl_code::IoctlInitializeResponse>() as u32,
             Some(&mut bytes_returned),
             None,
-        )
-        .expect("Failed to initialize");
+        )?;
     }
     Ok(())
 }
@@ -57,8 +50,7 @@ pub fn startup(
             0,
             Some(&mut bytes_returned),
             None,
-        )
-        .expect("Failed to startup");
+        )?;
     }
 
     Ok(())
@@ -85,3 +77,24 @@ pub fn map_rb(
         Ok(response)
     }
 }
+
+pub fn startup_file(
+    device_handle: windows::Win32::Foundation::HANDLE,
+    config: &crate::types::FileModuleConfig,
+) -> Result<(), windows::core::Error> {
+    let mut bytes_returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            device_handle,
+            IOCTL_STARTUP,
+            Some(config as *const _ as *const c_void),
+            std::mem::size_of::<crate::types::FileModuleConfig>() as u32,
+            None,
+            0,
+            Some(&mut bytes_returned),
+            None,
+        )?;
+    }
+    Ok(())
+}
+

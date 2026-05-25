@@ -1,19 +1,20 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 //! Context structure and management for file objects
 
 extern crate alloc;
 use alloc::boxed::Box;
 use core::ptr::null_mut;
 
-use crate::network::context::NetworkContext;
+use crate::network::module::NetworkModule;
+use crate::file_monitor::file_module::FileModule;
 use crate::wdk_ext::wdf_wrapper::WdfIoQueueCreate;
 use wdk_sys::{NTSTATUS, ULONG};
 use crate::log;
+
+/// Polymorphic context representing either a Network or File module.
+pub enum ModuleContext {
+    Network(Box<NetworkModule>),
+    File(Box<FileModule>),
+}
 
 /// Context state enum
 #[repr(u8)]
@@ -26,8 +27,8 @@ pub enum ContextState {
     Closed = 0xD3,
 }
 
-/// Context structure for file objects
-/// Each open handle to the device has its own context
+/// Context structure for file objects.
+/// Each open handle to the device has its own general Context.
 #[repr(C)]
 pub struct Context {
     pub state: ContextState,
@@ -39,12 +40,13 @@ pub struct Context {
     // Manual queue to hold pending RECV requests
     pub recv_queue: wdk_sys::WDFQUEUE,
 
-    // from user request
+    // General configuration from user-space initialize request
     pub layer: u32,
     pub priority: u32,
     pub flags: u64,
 
-    pub network_ctx: NetworkContext,
+    // Polymorphic active module context
+    pub module: Option<ModuleContext>,
 }
 
 impl Context {
@@ -53,7 +55,7 @@ impl Context {
         device: wdk_sys::WDFDEVICE,
         object: wdk_sys::WDFFILEOBJECT,
     ) -> Result<Box<Context>, NTSTATUS> {
-        //Initialize spinlock
+        // Initialize spinlock
         let lock = wdk::wdf::SpinLock::create(&mut wdk_sys::WDF_OBJECT_ATTRIBUTES {
             Size: size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as ULONG,
             ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
@@ -63,8 +65,6 @@ impl Context {
         })?;
 
         // Create a manual I/O queue to hold pending RECV requests
-        // Initialize as manual queue. WDF_IO_QUEUE_CONFIG_INIT is an inline macro in C,
-        // so we manually replicate its behavior here.
         let mut queue_config = wdk_sys::WDF_IO_QUEUE_CONFIG {
             Size: size_of::<wdk_sys::WDF_IO_QUEUE_CONFIG>() as ULONG,
             DispatchType: wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchManual,
@@ -91,7 +91,7 @@ impl Context {
             return Err(status);
         }
 
-        let mut context: Context = Context {
+        let context: Context = Context {
             state: Default::default(),
             lock,
             device,
@@ -100,20 +100,15 @@ impl Context {
             layer: 0,
             priority: 0,
             flags: 0,
-            network_ctx: NetworkContext::new()?,
+            module: None,
         };
 
         Ok(Box::new(context))
     }
 
-    /// Initialize the context (called during file create)
+    /// Initialize the context state to Open (called during file create/initialization)
     pub fn initialize(&mut self) -> Result<(), NTSTATUS> {
-        // Initialize network context
-        self.network_ctx.initialize()?;
-
-        // set state to Opening
         self.set_state(ContextState::Open);
-
         Ok(())
     }
 
@@ -144,6 +139,22 @@ impl Context {
     /// Set context state
     pub fn set_state(&mut self, new_state: ContextState) {
         self.state = new_state;
+    }
+
+    /// Safe helper to get a pointer to the active NetworkContext if this context is a network module.
+    pub fn get_network_ctx_ptr(&self) -> *mut crate::network::context::NetworkContext {
+        if let Some(ModuleContext::Network(net_module)) = &self.module {
+            return &net_module.network_ctx as *const _ as *mut _;
+        }
+        core::ptr::null_mut()
+    }
+
+    /// Safe helper to get a pointer to the active NetworkModule if this context is a network module.
+    pub fn get_network_module_ptr(&self) -> *mut crate::network::module::NetworkModule {
+        if let Some(ModuleContext::Network(net_module)) = &self.module {
+            return &**net_module as *const _ as *mut _;
+        }
+        core::ptr::null_mut()
     }
 }
 

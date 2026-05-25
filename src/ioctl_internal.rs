@@ -1,13 +1,8 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 use wdk_sys::{
     FILE_DEVICE_NETWORK, FILE_READ_DATA, FILE_WRITE_DATA, METHOD_IN_DIRECT, METHOD_OUT_DIRECT,
     PVOID,
 };
+use crate::network::bpf::BpfInsn;
 
 pub const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
     (device_type << 16) | (access << 14) | (function << 2) | method
@@ -66,6 +61,13 @@ pub const IOCTL_MAP_MM: u32 = ctl_code(
     FILE_DEVICE_NETWORK,
     0x930,
     METHOD_OUT_DIRECT,
+    FILE_READ_DATA | FILE_WRITE_DATA,
+);
+
+pub const IOCTL_SET_BPF: u32 = ctl_code(
+    FILE_DEVICE_NETWORK,
+    0x931,
+    METHOD_IN_DIRECT,
     FILE_READ_DATA | FILE_WRITE_DATA,
 );
 
@@ -152,4 +154,45 @@ pub struct IoctlMMapResponse {
     pub ring_buffer_data: PVOID,
     pub send_ring_buffer_header: PVOID,
     pub send_ring_buffer_data: PVOID,
+}
+
+pub const MAX_FILTER_RULES: usize = 16;
+pub const MAX_RULE_PATH_LEN: usize = 260; // Max Win32 path length
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FileFilterRule {
+    pub operation_mask: u32, // Bitmask: 1=Create, 2=Write, 4=Delete, 8=Rename
+    pub match_type: u32,     // MatchType: 0=Exact, 1=Prefix, 2=Suffix, 3=Glob
+    pub path_len: u32,       // Length of the suffix/prefix path pattern
+    pub path: [u16; MAX_RULE_PATH_LEN], // UTF-16 character pattern
+    pub process_id: u32,     // Process ID to filter (0 = match all processes)
+    pub is_exclude_process: u32, // 1 = Exclude (whitelist PID), 0 = Include (blacklist PID)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FileModuleConfig {
+    pub timeout_ms: u32,       // Interception timeout in milliseconds
+    pub default_action: u32,   // 1 = Allow, 2 = Deny
+    pub rule_count: u32,       // Number of active filtering rules
+    pub rules: [FileFilterRule; MAX_FILTER_RULES],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FileDecision {
+    pub transaction_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FileEvent {
+    pub transaction_id: u64,
+    pub process_id: u32,
+    pub op_code: u32,      // 1=Create, 2=Write, 4=Delete, 8=Rename
+    pub path_len: u32,     // Length of path in characters
+    pub decision: u32,     // 1 = Allow, 2 = Deny, 3 = Redirect (default initialized to 1)
+    pub redirect_path_len: u32,
+    pub redirect_path: [u16; MAX_RULE_PATH_LEN],
 }

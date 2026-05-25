@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 use crate::ioctl::map_rb;
 use crate::ioctl_code::{DivertIoctlMMapRequest, IOCTL_RECV, IOCTL_SEND};
 use crate::DivertAddress;
@@ -21,11 +15,10 @@ use windows::Win32::System::IO::DeviceIoControl;
 /// 2. A **Packet Record**: Header (ty=1) + Raw packet bytes.
 ///
 /// This allows the driver to pass complex metadata alongside the raw capture.
-#[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Clone, Copy, Debug)]
 struct RecordHeader {
     len: u32,
-    ty: u32,
+    _reserved: u32,
 }
 
 #[repr(C, align(64))]
@@ -102,6 +95,66 @@ impl<'a> Drop for PacketRef<'a> {
     }
 }
 
+/// A reference to a file event in the ring buffer.
+/// The ring buffer's read pointer (`head`) is advanced only when this reference is dropped.
+/// This ensures the data is valid as long as this reference exists.
+pub struct FileEventRef<'a> {
+    pub core_id: u32,
+    pub event: crate::types::FileEvent,
+    pub path: String,
+
+    // Internals for advancing the ring buffer head on drop
+    header_ptr: *mut RingBufferHeader,
+    pub(crate) old_head: usize,
+    record_len: usize,
+    rb_client: &'a RingBufferClient,
+}
+
+impl<'a> Drop for FileEventRef<'a> {
+    fn drop(&mut self) {
+        // Advance the head pointer to release the buffer space.
+        let new_head = self.old_head.wrapping_add(self.record_len);
+        unsafe {
+            (*self.header_ptr).c.head.store(new_head, Ordering::Release);
+        }
+    }
+}
+
+impl<'a> FileEventRef<'a> {
+    pub fn set_decision(&self, decision: crate::types::FileCallbackDecision) {
+        let mut event = self.event;
+        match decision {
+            crate::types::FileCallbackDecision::Allow => {
+                event.decision = crate::types::FILE_ACTION_ALLOW;
+                event.redirect_path_len = 0;
+            }
+            crate::types::FileCallbackDecision::Deny => {
+                event.decision = crate::types::FILE_ACTION_DENY;
+                event.redirect_path_len = 0;
+            }
+            crate::types::FileCallbackDecision::Redirect(ref target_path) => {
+                event.decision = 3; // Redirect
+                let utf16: Vec<u16> = target_path.encode_utf16().collect();
+                let len = utf16.len().min(crate::types::MAX_RULE_PATH_LEN);
+                event.redirect_path_len = len as u32;
+                event.redirect_path = [0u16; crate::types::MAX_RULE_PATH_LEN];
+                event.redirect_path[..len].copy_from_slice(&utf16[..len]);
+            }
+        }
+
+        // Overwrite the FileEvent structure inside the ring buffer.
+        // It resides at old_head + RECORD_HEADER_SIZE.
+        const RECORD_HEADER_SIZE: usize = size_of::<RecordHeader>();
+        self.rb_client.write_to_rb(
+            self.core_id,
+            self.old_head,
+            RECORD_HEADER_SIZE,
+            &event,
+        );
+    }
+}
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Defines the strategy for polling for packets.
 pub enum PollMode {
@@ -168,6 +221,10 @@ impl RingBufferClient {
         self.max_cores
     }
 
+    pub fn handle(&self) -> HANDLE {
+        self.handle
+    }
+
     /// Fetches the next available packet from any of the core-specific ring buffers.
     /// It round-robins through the cores.
     pub fn next_packet(&self) -> Option<PacketRef<'_>> {
@@ -190,69 +247,167 @@ impl RingBufferClient {
         let header_ptr = unsafe { self.headers.add(core as usize) };
         let buffer_data = unsafe { self.data_addrs.add(core as usize * self.size) };
 
-        // Load current buffer indices
-        let (head, _, unread_size) = self.get_buffer_status(header_ptr);
-
         const RECORD_HEADER_SIZE: usize = size_of::<RecordHeader>();
         const ADDRESS_SIZE: usize = size_of::<DivertAddress>();
 
-        // --- Phase 1: Check for Address Record ---
-        if unread_size == 0 || unread_size > self.size {
+        loop {
+            // Load current buffer indices
+            let (head, _, unread_size) = self.get_buffer_status(header_ptr);
+
+            if unread_size == 0 || unread_size > self.size {
+                return None;
+            }
+
+            if unread_size < RECORD_HEADER_SIZE {
+                return None;
+            }
+
+            // Read the single RecordHeader
+            let rh_offset = head & self.mask;
+            let rh = self.read_from_rb::<RecordHeader>(buffer_data, rh_offset);
+
+            // Check if it's a dummy record (failed transaction in CAS MPSC mode)
+            if rh._reserved == 0xDEADBEEF {
+                let total_record_len = RECORD_HEADER_SIZE + rh.len as usize;
+                if unread_size < total_record_len {
+                    return None; // Wait until the dummy record is fully committed
+                }
+                // Skip the dummy record by advancing the head
+                let new_head = head.wrapping_add(total_record_len);
+                unsafe {
+                    (*header_ptr).c.head.store(new_head, Ordering::Release);
+                }
+                continue; // Process next record
+            }
+
+            if unread_size < RECORD_HEADER_SIZE + ADDRESS_SIZE {
+                return None;
+            }
+
+            // Consistency check: Ensure the length contains at least the DivertAddress
+            if (rh.len as usize) < ADDRESS_SIZE {
+                return None;
+            }
+
+            let total_record_len = RECORD_HEADER_SIZE + rh.len as usize;
+
+            // Ensure the producer has finished writing the full record (header + address + payload)
+            if unread_size < total_record_len {
+                return None;
+            }
+
+            // Extract the DivertAddress metadata
+            let addr_offset = (head + RECORD_HEADER_SIZE) & self.mask;
+            let address = self.read_from_rb::<DivertAddress>(buffer_data, addr_offset);
+
+            // Construct PacketData view of the payload bytes starting after DivertAddress
+            let data_len = rh.len as usize - ADDRESS_SIZE;
+            let data_offset = (head + RECORD_HEADER_SIZE + ADDRESS_SIZE) & self.mask;
+            let packet_data = self.get_packet_data_view(buffer_data, data_offset, data_len);
+
+            return Some(PacketRef {
+                core_id: core,
+                record_type: 0, // This is reserved / unused now
+                address,
+                data: packet_data,
+                header_ptr,
+                old_head: head,
+                record_len: total_record_len, // Advance past the single unified record on drop
+            });
+        }
+    }
+
+    /// Fetches the next available file event from any of the core-specific ring buffers.
+    /// It round-robins through the cores.
+    pub fn next_file_event(&self) -> Option<FileEventRef<'_>> {
+        for _ in 0..self.max_cores {
+            let core = self.current_core.fetch_add(1, Ordering::Relaxed) % self.max_cores;
+            if let Some(event) = self.next_file_event_for_core(core) {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    /// Fetches the next available file event from a specific core's ring buffer.
+    pub fn next_file_event_for_core(&self, core: u32) -> Option<FileEventRef<'_>> {
+        if core >= self.max_cores {
             return None;
         }
 
-        if unread_size < RECORD_HEADER_SIZE + ADDRESS_SIZE {
-            return None;
+        let header_ptr = unsafe { self.headers.add(core as usize) };
+        let buffer_data = unsafe { self.data_addrs.add(core as usize * self.size) };
+
+        const RECORD_HEADER_SIZE: usize = size_of::<RecordHeader>();
+        let file_event_size: usize = size_of::<crate::types::FileEvent>();
+
+        loop {
+            // Load current buffer indices
+            let (head, _, unread_size) = self.get_buffer_status(header_ptr);
+
+            if unread_size == 0 || unread_size > self.size {
+                return None;
+            }
+
+            if unread_size < RECORD_HEADER_SIZE {
+                return None;
+            }
+
+            // Read the record header
+            let rh_offset = head & self.mask;
+            let rh = self.read_from_rb::<RecordHeader>(buffer_data, rh_offset);
+
+            // Check if it's a dummy record (failed transaction in CAS MPSC mode)
+            if rh._reserved == 0xDEADBEEF {
+                let total_record_len = RECORD_HEADER_SIZE + rh.len as usize;
+                if unread_size < total_record_len {
+                    return None; // Wait until the dummy record is fully committed
+                }
+                // Skip the dummy record by advancing the head
+                let new_head = head.wrapping_add(total_record_len);
+                unsafe {
+                    (*header_ptr).c.head.store(new_head, Ordering::Release);
+                }
+                continue; // Process next record
+            }
+
+            if unread_size < RECORD_HEADER_SIZE + file_event_size {
+                return None;
+            }
+
+            let record_len = rh.len as usize; // size_of::<FileEvent>() + path_len * 2
+            let total_record_len = RECORD_HEADER_SIZE + record_len;
+
+            // Ensure the entire record is written in the ring buffer
+            if unread_size < total_record_len {
+                return None;
+            }
+
+            // Read the FileEvent struct
+            let event_offset = (head + RECORD_HEADER_SIZE) & self.mask;
+            let event = self.read_from_rb::<crate::types::FileEvent>(buffer_data, event_offset);
+
+            // Read the path
+            let path_u16_len = event.path_len as usize;
+            let mut path_u16 = vec![0u16; path_u16_len];
+            if path_u16_len > 0 {
+                let path_offset = (head + RECORD_HEADER_SIZE + file_event_size) & self.mask;
+                self.copy_data_from_rb(buffer_data, path_offset, unsafe {
+                    std::slice::from_raw_parts_mut(path_u16.as_mut_ptr() as *mut u8, path_u16_len * 2)
+                });
+            }
+            let path = String::from_utf16_lossy(&path_u16);
+
+            return Some(FileEventRef {
+                core_id: core,
+                event,
+                path,
+                header_ptr,
+                old_head: head,
+                record_len: total_record_len,
+                rb_client: self,
+            });
         }
-
-        // Read the header of the first record (The Address Record)
-        let rh1_offset = head & self.mask;
-        let rh1 = self.read_from_rb::<RecordHeader>(buffer_data, rh1_offset);
-
-        // Consistency check: Ensure the first record is exactly the size of a DivertAddress.
-        if rh1.len as usize != ADDRESS_SIZE {
-            // If length mismatch, the ring buffer protocol is out of sync.
-            // Returning None here prevents processing garbage data.
-            return None;
-        }
-
-        // Extract the DivertAddress metadata
-        let addr_offset = (head + RECORD_HEADER_SIZE) & self.mask;
-        let address = self.read_from_rb::<DivertAddress>(buffer_data, addr_offset);
-
-        // --- Phase 2: Check for Packet Record ---
-        let rh2_absolute_pos = head + RECORD_HEADER_SIZE + ADDRESS_SIZE;
-        let total_so_far = RECORD_HEADER_SIZE + ADDRESS_SIZE;
-
-        // Ensure the second header (Packet Header) has been written by the producer.
-        if unread_size < total_so_far + RECORD_HEADER_SIZE {
-            return None;
-        }
-
-        // Read the header of the second record (The Packet Data Record)
-        let rh2_offset = rh2_absolute_pos & self.mask;
-        let rh2 = self.read_from_rb::<RecordHeader>(buffer_data, rh2_offset);
-
-        let data_len = rh2.len as usize;
-        let total_record_len = total_so_far + RECORD_HEADER_SIZE + data_len;
-
-        // Ensure the producer has finished writing the full payload.
-        if unread_size < total_record_len {
-            return None;
-        }
-
-        let data_offset = (rh2_absolute_pos + RECORD_HEADER_SIZE) & self.mask;
-        let packet_data = self.get_packet_data_view(buffer_data, data_offset, data_len);
-
-        Some(PacketRef {
-            core_id: core,
-            record_type: rh2.ty,
-            address,
-            data: packet_data,
-            header_ptr,
-            old_head: head,
-            record_len: total_record_len, // Advance past both records on drop.
-        })
     }
 
     /// Helper: Read a Sized type from the ring buffer, handling wrap-around.
@@ -266,6 +421,22 @@ impl RingBufferClient {
                 std::slice::from_raw_parts_mut(temp.as_mut_ptr() as *mut u8, size)
             });
             unsafe { temp.assume_init() }
+        }
+    }
+
+    /// Overwrites a Sized type inside the ring buffer, handling wrap-around.
+    pub fn write_to_rb<T: Sized>(&self, core: u32, start_tail: usize, offset_from_start: usize, value: &T) {
+        let size = size_of::<T>();
+        let buffer_data = unsafe { self.data_addrs.add(core as usize * self.size) };
+        let write_offset = (start_tail + offset_from_start) & self.mask;
+        let len1 = (self.size - write_offset).min(size);
+        let len2 = size - len1;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(value as *const T as *const u8, buffer_data.add(write_offset), len1);
+            if len2 > 0 {
+                std::ptr::copy_nonoverlapping((value as *const T as *const u8).add(len1), buffer_data, len2);
+            }
         }
     }
 
@@ -330,8 +501,8 @@ impl RingBufferClient {
         const RH_SIZE: usize = size_of::<RecordHeader>();
         const ADDR_SIZE: usize = size_of::<DivertAddress>();
 
-        // Packet structure: (RecordHeader + Address) + (RecordHeader + Payload)
-        let total_required_size = (RH_SIZE * 2) + ADDR_SIZE + data.len();
+        // Unified layout: RecordHeader + DivertAddress + PacketData
+        let total_required_size = RH_SIZE + ADDR_SIZE + data.len();
 
         if free_space < total_required_size {
             return Err(anyhow!(
@@ -341,34 +512,91 @@ impl RingBufferClient {
             ));
         }
 
-        // --- Step 1: Write the Address Record ---
-        let addr_header = RecordHeader {
-            len: ADDR_SIZE as u32,
-            ty: 0, // Type 0: Address metadata
+        // --- Step 1: Write the Unified RecordHeader ---
+        let unified_header = RecordHeader {
+            len: (ADDR_SIZE + data.len()) as u32,
+            _reserved: 0,
         };
         let mut current_offset = tail & self.mask;
 
         self.copy_to_buffer(
             send_data_buffer,
             &mut current_offset,
-            as_u8_slice(&addr_header),
+            as_u8_slice(&unified_header),
         );
+
+        // --- Step 2: Write the DivertAddress ---
         self.copy_to_buffer(send_data_buffer, &mut current_offset, as_u8_slice(addr));
 
-        // --- Step 2: Write the Packet Data Record ---
-        let packet_header = RecordHeader {
-            len: data.len() as u32,
-            ty: 1, // Type 1: Packet payload
+        // --- Step 3: Write the Packet Data ---
+        self.push_data_to_rb(send_data_buffer, current_offset, data);
+
+        // 4. Atomically update Tail to notify the driver.
+        unsafe {
+            (*send_header_ptr)
+                .p
+                .tail
+                .store(tail.wrapping_add(total_required_size), Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub fn push_send_packet_data(&self, addr: &DivertAddress, data: &PacketData<'_>) -> Result<()> {
+        let core = 0; // Default to core 0 for send ringbuffer
+        let send_header_ptr = unsafe { self.send_headers.add(core) };
+        let send_data_buffer = self.send_data_addrs; // since core is 0
+
+        let (head, tail, unread_size) = self.get_buffer_status(send_header_ptr);
+
+        // Defensive check to avoid underflow if the ring buffer state is corrupted.
+        if unread_size > self.size || tail < head.wrapping_sub(self.size) {
+            return Err(anyhow!("Send ring buffer state corruption detected"));
+        }
+        let free_space = self.size.saturating_sub(unread_size);
+
+        const RH_SIZE: usize = size_of::<RecordHeader>();
+        const ADDR_SIZE: usize = size_of::<DivertAddress>();
+
+        let data_len = data.len();
+        let total_required_size = RH_SIZE + ADDR_SIZE + data_len;
+
+        if free_space < total_required_size {
+            return Err(anyhow!(
+                "Send ring buffer is full (required: {}, free: {})",
+                total_required_size,
+                free_space
+            ));
+        }
+
+        // --- Step 1: Write the Unified RecordHeader ---
+        let unified_header = RecordHeader {
+            len: (ADDR_SIZE + data_len) as u32,
+            _reserved: 0,
         };
+        let mut current_offset = tail & self.mask;
 
         self.copy_to_buffer(
             send_data_buffer,
             &mut current_offset,
-            as_u8_slice(&packet_header),
+            as_u8_slice(&unified_header),
         );
-        self.push_data_to_rb(send_data_buffer, current_offset, data);
 
-        // 3. Atomically update Tail to notify the driver.
+        // --- Step 2: Write the DivertAddress ---
+        self.copy_to_buffer(send_data_buffer, &mut current_offset, as_u8_slice(addr));
+
+        // --- Step 3: Write the Packet Data (handles wrapped buffers zero-copy) ---
+        match data {
+            PacketData::Contiguous(slice) => {
+                self.push_data_to_rb(send_data_buffer, current_offset, slice);
+            }
+            PacketData::Wrapped { part1, part2 } => {
+                let mut tmp_offset = current_offset;
+                self.copy_to_buffer(send_data_buffer, &mut tmp_offset, part1);
+                self.push_data_to_rb(send_data_buffer, tmp_offset, part2);
+            }
+        }
+
+        // 4. Atomically update Tail to notify the driver.
         unsafe {
             (*send_header_ptr)
                 .p
@@ -455,30 +683,18 @@ impl RingBufferClient {
     /// `Ok(Some(packet))` if a packet was found.
     /// `Ok(None)` if no packet was found after applying the polling strategy.
     /// `Err` if an error occurred (e.g., during `IoctlWait`).
-    pub fn poll<'a, F>(&'a self, mode: PollMode, mut on_no_packet: F) -> Result<Option<PacketRef<'a>>>
+    pub fn poll<'a, F>(&'a self, mut on_no_packet: F) -> Result<Option<PacketRef<'a>>>
     where
         F: FnMut(),
     {
-        // First attempt to get a packet, common to all modes.
+        // First attempt to get a packet.
         if let Some(packet) = self.next_packet() {
             return Ok(Some(packet));
         }
 
-        // If no packet was found, apply the strategy determined by the poll mode.
-        match mode {
-            PollMode::BusyPoll => {
-                // In busy-poll mode, invoke the provided callback.
-                on_no_packet();
-                // After the callback, try one more time to get a packet.
-                Ok(self.next_packet())
-            }
-            PollMode::Default |PollMode::IoctlWait => {
-                // In wait mode, block until the driver signals data is available.
-                self.wait_for_data()?;
-                // After waiting, try one more time to get a packet.
-                Ok(self.next_packet())
-            }
-        }
+        // Invoke the callback and try one more time.
+        on_no_packet();
+        Ok(self.next_packet())
     }
 }
 

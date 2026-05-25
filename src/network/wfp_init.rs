@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 use crate::context::Context;
 use crate::log;
 use crate::network::callout_network::*;
@@ -51,7 +45,10 @@ pub fn init_wfp(device: wdk_sys::WDFDEVICE, context_ptr: *mut Context) -> Result
             log!("init_wfp: FwpmEngineOpen0 failed: {:#010X}", status);
             return Err(status);
         }
-        (*context_ptr).network_ctx.fwpm_engine_handle = engine_handle;
+        let net_ctx = (*context_ptr).get_network_ctx_ptr();
+        if !net_ctx.is_null() {
+            (*net_ctx).fwpm_engine_handle = engine_handle;
+        }
 
         // 2. Start transaction for atomic configuration
         let status = FwpmTransactionBegin0(engine_handle, 0);
@@ -72,16 +69,20 @@ pub fn init_wfp(device: wdk_sys::WDFDEVICE, context_ptr: *mut Context) -> Result
                 },
                 ..Default::default()
             };
-            FwpmProviderAdd0(engine_handle, &provider, null_mut())
-                .check()
-                .inspect_err(|status| log!("Failed to add provider: {:#010X}", status))?;
+            let status = FwpmProviderAdd0(engine_handle, &provider, null_mut());
+            if status != STATUS_SUCCESS && status != 0xC0220009u32 as i32 {
+                status.check().inspect_err(|status| log!("Failed to add provider: {:#010X}", status))?;
+            }
 
             // Dynamically generate Sublayer GUID
             let mut sublayer_guid = GUID::default();
             wdk_sys::ntddk::ExUuidCreate(&mut sublayer_guid);
 
             // Store sublayer guid in context to use later if needed
-            (*context_ptr).network_ctx.sublayer_guid = sublayer_guid;
+            let net_ctx = (*context_ptr).get_network_ctx_ptr();
+            if !net_ctx.is_null() {
+                (*net_ctx).sublayer_guid = sublayer_guid;
+            }
 
             let s_name = wstr!("MyDynamicSublayer");
             let sublayer = FWPM_SUBLAYER0 {
@@ -171,13 +172,30 @@ pub fn init_wfp(device: wdk_sys::WDFDEVICE, context_ptr: *mut Context) -> Result
                     },
                     ..Default::default()
                 };
+                let mut registered_callout_id: u32 = 0;
                 FwpsCalloutRegister0(
                     WdfDeviceWdmGetDeviceObject(device) as *mut _,
                     &reg_callout,
-                    null_mut(),
+                    &mut registered_callout_id,
                 )
                 .check()
                 .inspect_err(|status| log!("Failed to register callout: {:#010X}", status))?;
+
+                let net_ctx = (*context_ptr).get_network_ctx_ptr();
+                if !net_ctx.is_null() {
+                    let net_ctx_ref = &mut *net_ctx;
+                    if layer == LAYER_STREAM {
+                        if let crate::network::context::WfpLayer::Stream(ref mut stream_layer) = net_ctx_ref.active_layer {
+                            if i == 0 {
+                                stream_layer.stream_callout_id_v4 = registered_callout_id;
+                                log!("Registered StreamV4 callout runtime ID: {}", registered_callout_id);
+                            } else if i == 1 {
+                                stream_layer.stream_callout_id_v6 = registered_callout_id;
+                                log!("Registered StreamV6 callout runtime ID: {}", registered_callout_id);
+                            }
+                        }
+                    }
+                }
 
                 // Management-plane callout registration
                 let c_name = wstr!(format!("Callout_{}", name_str));
@@ -232,7 +250,10 @@ pub fn init_wfp(device: wdk_sys::WDFDEVICE, context_ptr: *mut Context) -> Result
                     .check()
                     .inspect_err(|status| log!("Failed to add filter: {:#010X}", status))?;
 
-                (*context_ptr).network_ctx.filter_ids.push(filter_id);
+                let net_ctx = (*context_ptr).get_network_ctx_ptr();
+                if !net_ctx.is_null() {
+                    (*net_ctx).filter_ids.push(filter_id);
+                }
             }
 
             Ok(())
@@ -265,9 +286,12 @@ pub fn uninit_wfp(engine_h: HANDLE, context_ptr: *mut Context) {
 
         // 1. Delete filters (using the IDs stored in the context)
         if !context_ptr.is_null() {
-            for filter_id in &(*context_ptr).network_ctx.filter_ids {
-                if *filter_id != 0 {
-                    FwpmFilterDeleteById0(engine_h, *filter_id);
+            let net_ctx = (*context_ptr).get_network_ctx_ptr();
+            if !net_ctx.is_null() {
+                for filter_id in &(*net_ctx).filter_ids {
+                    if *filter_id != 0 {
+                        FwpmFilterDeleteById0(engine_h, *filter_id);
+                    }
                 }
             }
         }

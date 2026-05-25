@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 github.com/one-api. All rights reserved.
- * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
- * See: https://github.com/one-api/FastDivert#license
- */
-
 use crate::wdk_ext::wdf_wrapper::*;
 use crate::{file, log};
 use alloc::vec::Vec;
@@ -24,6 +18,20 @@ pub unsafe extern "system" fn driver_entry(
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
     log!("DriverEntry: Starting initialization");
+
+    // Copy registry path globally
+    if !registry_path.is_null() {
+        unsafe {
+            let len = ((*registry_path).Length / 2) as usize;
+            let mut buf = alloc::vec::Vec::with_capacity(len + 1);
+            core::ptr::copy_nonoverlapping((*registry_path).Buffer, buf.as_mut_ptr(), len);
+            buf.set_len(len);
+            buf.push(0); // Null terminator
+            crate::set_global_registry_path(buf);
+        }
+    }
+
+    crate::set_global_driver_object(driver);
 
     // 1. Initialize WDF driver
     let (driver_handle, status) = create_driver_object(driver, registry_path);
