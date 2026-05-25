@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2026 github.com/one-api. All rights reserved.
+ * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
+ * See: https://github.com/one-api/FastDivert#license
+ */
+
 use wdk_sys::{
     FILE_DEVICE_NETWORK, FILE_READ_DATA, FILE_WRITE_DATA, METHOD_IN_DIRECT, METHOD_OUT_DIRECT,
     PVOID,

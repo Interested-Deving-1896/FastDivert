@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2026 github.com/one-api. All rights reserved.
+ * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
+ * See: https://github.com/one-api/FastDivert#license
+ */
+
 pub const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
     (device_type << 16) | (access << 14) | (function << 2) | method
 }

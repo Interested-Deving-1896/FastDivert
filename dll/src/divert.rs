@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2026 github.com/one-api. All rights reserved.
+ * Licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html) or a commercial license.
+ * See: https://github.com/one-api/FastDivert#license
+ */
+
 use crate::driver_install::uninstall_driver;
 use crate::ioctl_code::DivertIoctlMMapRequest;
 use crate::bpf_compiler::BpfInsn;
